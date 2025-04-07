@@ -46,7 +46,7 @@ class Up(nn.Module):
         super().__init__()
 
         # if bilinear, use the normal convolutions to reduce the number of channels
-        if bilinear:
+        if (bilinear):
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
             self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
         else:
@@ -75,3 +75,21 @@ class OutConv(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
+
+class FeaturePyramid(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
+        self.downsample = nn.AvgPool2d(kernel_size=2)
+        
+    def forward(self, x):
+        x1 = self.conv1x1(x)  # 保持输入的空间维度
+        x2 = self.downsample(x1)  # 空间维度减半
+        # 对 x2 进行上采样，使其与 x1 的空间维度一致
+        x2_upsampled = F.interpolate(x2, size=x1.shape[2:], mode='bilinear', align_corners=False)
+        # print(f"x1 shape: {x1.shape}, x2 shape: {x2.shape}")
+        return torch.cat([x1, x2_upsampled], dim=1)  # 在通道维度拼接
+
+
+

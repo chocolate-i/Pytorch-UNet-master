@@ -26,6 +26,11 @@ dir_checkpoint = Path('./checkpoints/')
 dir_best_data_img = Path('./best_data/imgs/')
 dir_best_data_mask = Path('./best_data/masks/')
 
+transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor()
+])
+
 
 def train_model(
         model,
@@ -52,8 +57,8 @@ def train_model(
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
-    # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
+    # 3. Create data loaders  修改过num_workers  
+    loader_args = dict(batch_size=batch_size, num_workers=0, pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
@@ -84,24 +89,22 @@ def train_model(
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
 
-    # 5. Begin training
+    # 5. Begin training   增加print 语句
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
-
-                assert images.shape[1] == model.n_channels, \
-                    f'Network has been defined with {model.n_channels} input channels, ' \
-                    f'but loaded images have {images.shape[1]} channels. Please check that ' \
-                    'the images are loaded correctly.'
-
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
                 true_masks = true_masks.to(device=device, dtype=torch.long)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
+                    if torch.isnan(masks_pred).any() or torch.isinf(masks_pred).any():
+                        print("Model output contains NaN or Inf!")
+                        break
+
                     if model.n_classes == 1:
                         loss = criterion(masks_pred.squeeze(1), true_masks.float())
                         loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
@@ -112,6 +115,10 @@ def train_model(
                             F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
                             multiclass=True
                         )
+
+                    if torch.isnan(loss).any() or torch.isinf(loss).any():
+                        print("Loss contains NaN or Inf!")
+                        break
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()

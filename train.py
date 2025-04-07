@@ -22,6 +22,9 @@ from utils.dice_score import dice_loss
 dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
+# 新增筛选后数据保存目录
+dir_best_data_img = Path('./best_data/imgs/')
+dir_best_data_mask = Path('./best_data/masks/')
 
 
 def train_model(
@@ -166,6 +169,52 @@ def train_model(
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
 
+    return model, dataset
+
+# 新增筛选函数
+def select_best_data(model, dataset, device, top_percent=0.2, amp=False):
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    scores = []
+    indices = []
+    model.eval()
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(loader, desc="Evaluating all data")):
+            images, true_masks = batch['image'], batch['mask']
+            images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+            true_masks = true_masks.to(device=device, dtype=torch.long)
+            with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+                masks_pred = model(images)
+            # 计算每个样本的 Dice 分数
+            if model.n_classes == 1:
+                score = 1 - dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
+            else:
+                score = 1 - dice_loss(
+                    F.softmax(masks_pred, dim=1).float(),
+                    F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
+                    multiclass=True
+                )
+            scores.append(score.item())
+            indices.append(i)
+
+    # 按分数排序
+    sorted_indices = [x for _, x in sorted(zip(scores, indices), reverse=True)]
+    num_best = int(len(dataset) * top_percent)
+    best_indices = sorted_indices[:num_best]
+
+    # 创建保存目录
+    dir_best_data_img.mkdir(parents=True, exist_ok=True)
+    dir_best_data_mask.mkdir(parents=True, exist_ok=True)
+
+    # 保存筛选后的数据
+    import shutil
+    for idx in best_indices:
+        img_path = dataset.images[idx]
+        mask_path = dataset.masks[idx]
+        shutil.copy(img_path, dir_best_data_img / img_path.name)
+        shutil.copy(mask_path, dir_best_data_mask / mask_path.name)
+
+    logging.info(f"Selected top {top_percent * 100}% data saved to {dir_best_data_img} and {dir_best_data_mask}")
+
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
@@ -180,6 +229,7 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--top-percent', type=float, default=0.2, help='Percentage of best data to select')
 
     return parser.parse_args()
 
@@ -210,7 +260,7 @@ if __name__ == '__main__':
 
     model.to(device=device)
     try:
-        train_model(
+        trained_model, dataset = train_model(
             model=model,
             epochs=args.epochs,
             batch_size=args.batch_size,
@@ -220,13 +270,15 @@ if __name__ == '__main__':
             val_percent=args.val / 100,
             amp=args.amp
         )
+        # 筛选数据
+        select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp)
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
                       'Enabling checkpointing to reduce memory usage, but this slows down training. '
                       'Consider enabling AMP (--amp) for fast and memory efficient training')
         torch.cuda.empty_cache()
         model.use_checkpointing()
-        train_model(
+        trained_model, dataset = train_model(
             model=model,
             epochs=args.epochs,
             batch_size=args.batch_size,
@@ -236,3 +288,5 @@ if __name__ == '__main__':
             val_percent=args.val / 100,
             amp=args.amp
         )
+        # 筛选数据
+        select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp)

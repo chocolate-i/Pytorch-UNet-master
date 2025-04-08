@@ -297,4 +297,3 @@ if __name__ == '__main__':
         )
         # 筛选数据
         select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp)
-

@@ -19,8 +19,10 @@ from unet import UNet
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
 
-dir_img = Path('./data/imgs/')
-dir_mask = Path('./data/masks/')
+# dir_img = Path('./data/imgs/')
+# dir_mask = Path('./data/masks/')
+dir_img = Path('/root/chennuo/ISIC2018_Task1-2_Training_Input/')
+dir_mask = Path('/root/chennuo/ISIC2018_Task1_Training_GroundTruth/')
 dir_checkpoint = Path('./checkpoints/')
 # 新增筛选后数据保存目录
 dir_best_data_img = Path('./best_data/imgs/')

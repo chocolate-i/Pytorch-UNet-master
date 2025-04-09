@@ -105,20 +105,36 @@ def train_model(
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-                    if torch.isnan(masks_pred).any() or torch.isinf(masks_pred).any():
-                        print("Model output contains NaN or Inf!")
-                        break
 
+                    # 计算 Dice 分数
                     if model.n_classes == 1:
-                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
+                        dice_score = 1 - dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
                     else:
-                        loss = criterion(masks_pred, true_masks)
-                        loss += dice_loss(
+                        dice_score = 1 - dice_loss(
                             F.softmax(masks_pred, dim=1).float(),
                             F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
                             multiclass=True
                         )
+
+                    # 根据 Dice 分数动态调整权重
+                    weight = dice_score.detach()  # 使用 Dice 分数作为权重
+                    weight = torch.clamp(weight, min=0.1, max=1.0)  # 防止权重过小或过大
+
+                    # 计算加权损失
+                    if model.n_classes == 1:
+                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
+                        loss += weight * dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
+                    else:
+                        loss = criterion(masks_pred, true_masks)
+                        loss += weight * dice_loss(
+                            F.softmax(masks_pred, dim=1).float(),
+                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
+                            multiclass=True
+                        )
+
+                    if torch.isnan(masks_pred).any() or torch.isinf(masks_pred).any():
+                        print("Model output contains NaN or Inf!")
+                        break
 
                     if torch.isnan(loss).any() or torch.isinf(loss).any():
                         print("Loss contains NaN or Inf!")
@@ -271,6 +287,7 @@ if __name__ == '__main__':
 
     model.to(device=device)
     try:
+        # 初步训练模型
         trained_model, dataset = train_model(
             model=model,
             epochs=args.epochs,
@@ -281,14 +298,29 @@ if __name__ == '__main__':
             val_percent=args.val / 100,
             amp=args.amp
         )
-        # 筛选数据
+
+        # 筛选高 Dice 数据
         select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp)
+
+        # 用筛选后的数据重新训练
+        best_dataset = BasicDataset(dir_best_data_img, dir_best_data_mask, img_scale=args.scale)
+        trained_model, _ = train_model(
+            model=model,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            device=device,
+            img_scale=args.scale,
+            val_percent=args.val / 100,
+            amp=args.amp
+        )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
                       'Enabling checkpointing to reduce memory usage, but this slows down training. '
                       'Consider enabling AMP (--amp) for fast and memory efficient training')
         torch.cuda.empty_cache()
         model.use_checkpointing()
+        # 初步训练模型
         trained_model, dataset = train_model(
             model=model,
             epochs=args.epochs,
@@ -299,5 +331,19 @@ if __name__ == '__main__':
             val_percent=args.val / 100,
             amp=args.amp
         )
-        # 筛选数据
+
+        # 筛选高 Dice 数据
         select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp)
+
+        # 用筛选后的数据重新训练
+        best_dataset = BasicDataset(dir_best_data_img, dir_best_data_mask, img_scale=args.scale)
+        trained_model, _ = train_model(
+            model=model,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            device=device,
+            img_scale=args.scale,
+            val_percent=args.val / 100,
+            amp=args.amp
+        )

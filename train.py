@@ -25,9 +25,13 @@ dir_checkpoint = Path('./checkpoints/')
 # 新增筛选后数据保存目录
 dir_best_data_img = Path('./best_data/imgs/')
 dir_best_data_mask = Path('./best_data/masks/')
-
+# 数据增强
 transform = transforms.Compose([
-    transforms.Resize((256, 256)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+    transforms.RandomRotation(30),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    transforms.RandomResizedCrop((256, 256), scale=(0.8, 1.0)),  # 随机裁剪
     transforms.ToTensor()
 ])
 
@@ -63,7 +67,7 @@ def train_model(
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
     # (Initialize logging)
-    experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
+    experiment = wandb.init(project='U-Net', resume='allow', anonymous='allow')
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
@@ -85,7 +89,7 @@ def train_model(
     optimizer = optim.RMSprop(model.parameters(),
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
-    grad_scaler = torch.amp.GradScaler(enabled=amp)
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
 

@@ -1,0 +1,4 @@
+usage: train.py [-h] [--epochs E] [--batch-size B] [--learning-rate LR]
+                [--load LOAD] [--scale SCALE] [--validation VAL] [--amp]
+                [--bilinear] [--classes CLASSES] [--top-percent TOP_PERCENT]
+train.py: error: unrecognized arguments: -amp

@@ -31,11 +31,102 @@ dir_best_data_mask = Path('./best_data/masks/')
 transform = transforms.Compose([
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
-    transforms.RandomRotation(30),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-    transforms.RandomResizedCrop((256, 256), scale=(0.8, 1.0)),  # 随机裁剪
+    transforms.ColorJitter(brightness=0.1, contrast=0.1),
     transforms.ToTensor()
 ])
+
+
+class HybridLoss(nn.Module):
+    def __init__(self, alpha=0.8, gamma=2, smooth=1e-6):
+        super().__init__()
+        self.alpha = alpha    # Focal Loss 正类权重
+        self.gamma = gamma    # 难易样本调节因子
+        self.smooth = smooth  # 防止除零
+
+    def forward(self, inputs, targets, epoch=None, total_epochs=None):
+        """
+        :param inputs: 模型预测的 logits
+        :param targets: 真实标签
+        :param epoch: 当前训练的 epoch（用于动态权重调整）
+        :param total_epochs: 总训练的 epoch 数
+        """
+        # 确保 targets 是整数类型
+        targets = targets.long()
+
+        # 确定任务类型
+        if inputs.shape[1] > 1:  # 多分类任务
+            inputs = torch.softmax(inputs, dim=1)  # 使用 softmax
+            targets_one_hot = F.one_hot(targets, num_classes=inputs.shape[1]).permute(0, 3, 1, 2).float()
+        else:  # 二分类任务
+            inputs = torch.sigmoid(inputs)  # 使用 sigmoid
+            targets_one_hot = targets.unsqueeze(1).float()
+
+        # 动态权重调整
+        focal_weight, dice_weight, boundary_weight = self._dynamic_weights(epoch, total_epochs)
+
+        # 动态 Focal Loss
+        bce_loss = F.binary_cross_entropy(inputs, targets_one_hot, reduction='none') if inputs.shape[1] == 1 else F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-bce_loss)  # 正确分类概率
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        focal_loss = focal_loss.mean()
+
+        # 广义 Dice Loss
+        intersection = (inputs * targets_one_hot).sum(dim=(2, 3))
+        union = inputs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3))
+        dice_loss = 1 - ((2. * intersection + self.smooth) / (union + self.smooth)).mean()
+
+        # 边界敏感损失
+        boundary_mask = self._get_boundary_mask(targets_one_hot)
+        boundary_loss = F.mse_loss(inputs * boundary_mask, targets_one_hot * boundary_mask)
+
+        # 总损失
+        total_loss = focal_weight * focal_loss + dice_weight * dice_loss + boundary_weight * boundary_loss
+        return total_loss
+
+    def _dynamic_weights(self, epoch, total_epochs):
+        """
+        动态调整损失函数权重
+        :param epoch: 当前训练的 epoch
+        :param total_epochs: 总训练的 epoch 数
+        :return: focal_weight, dice_weight, boundary_weight
+        """
+        if epoch is None or total_epochs is None:
+            # 默认权重
+            return 0.4, 0.4, 0.2
+
+        # 动态调整权重
+        progress = epoch / total_epochs
+        focal_weight = max(0.2, 0.4 * (1 - progress**2))  # 非线性减少 Focal Loss 权重
+        dice_weight = min(0.6, 0.4 + 0.2 * progress**2)   # 非线性增加 Dice Loss 权重
+        boundary_weight = 0.2  # 边界损失权重保持不变
+        return focal_weight, dice_weight, boundary_weight
+
+    def _get_boundary_mask(self, targets, dilation_radius=2):
+        """
+        生成边界掩码
+        :param targets: 真实标签 (one-hot 编码, [batch_size, n_classes, height, width])
+        :param dilation_radius: 边界扩展半径
+        :return: 边界掩码
+        """
+        kernel = torch.ones((1, 1, 3, 3), device=targets.device)
+        boundary_masks = []
+
+        # 对每个通道单独计算边界
+        for c in range(targets.shape[1]):  # 遍历每个类别
+            channel = targets[:, c:c+1, :, :]  # 提取单个通道
+            eroded = F.max_pool2d(channel, kernel_size=3, stride=1, padding=1)
+            dilated = -F.max_pool2d(-channel, kernel_size=3, stride=1, padding=1)
+            boundary = (dilated - eroded).abs()
+            boundary_mask = F.conv2d(boundary, kernel, padding=dilation_radius) > 0
+            boundary_masks.append(boundary_mask)
+
+        # 合并所有通道的边界掩码
+        boundary_mask = torch.stack(boundary_masks, dim=1).float().squeeze(2)
+
+        # 调整边界掩码的尺寸与 targets 对齐
+        boundary_mask = F.interpolate(boundary_mask, size=targets.shape[2:], mode='nearest')
+
+        return boundary_mask
 
 
 def train_model(
@@ -89,7 +180,7 @@ def train_model(
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    criterion = HybridLoss()
     global_step = 0
 
     # 5. Begin training   增加print 语句
@@ -100,36 +191,13 @@ def train_model(
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
+                true_masks = true_masks.to(device=device, dtype=torch.float32)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
 
-                    # 计算 Dice 分数
-                    if model.n_classes == 1:
-                        dice_score = 1 - dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
-                    else:
-                        dice_score = 1 - dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
-
-                    # 根据 Dice 分数动态调整权重
-                    weight = dice_score.detach()  # 使用 Dice 分数作为权重
-                    weight = torch.clamp(weight, min=0.1, max=1.0)  # 防止权重过小或过大
-
-                    # 计算加权损失
-                    if model.n_classes == 1:
-                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        loss += weight * dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
-                    else:
-                        loss = criterion(masks_pred, true_masks)
-                        loss += weight * dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
+                    # 计算复合损失函数
+                    loss = criterion(masks_pred, true_masks, epoch=epoch, total_epochs=epochs)
 
                     if torch.isnan(masks_pred).any() or torch.isinf(masks_pred).any():
                         print("Model output contains NaN or Inf!")
@@ -198,7 +266,13 @@ def train_model(
     return model, dataset
 
 # 新增筛选函数
-def select_best_data(model, dataset, device, top_percent=0.2, amp=False):
+def select_best_data(model, dataset, device, top_percent=0.2, amp=False, epoch=None, total_epochs=None):
+    if epoch is not None and total_epochs is not None:
+        if epoch < total_epochs * 0.5:
+            top_percent = 0.3  # 前 50% 训练阶段，选择更多样本
+        else:
+            top_percent = 0.1  # 后 50% 训练阶段，选择更少但高质量的样本
+
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     scores = []
     indices = []
@@ -299,7 +373,7 @@ if __name__ == '__main__':
         )
 
         # 筛选高 Dice 数据
-        select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp)
+        select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp, epoch=args.epochs, total_epochs=args.epochs)
 
         # 用筛选后的数据重新训练
         best_dataset = BasicDataset(dir_best_data_img, dir_best_data_mask, img_scale=args.scale)
@@ -332,7 +406,7 @@ if __name__ == '__main__':
         )
 
         # 筛选高 Dice 数据
-        select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp)
+        select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp, epoch=args.epochs, total_epochs=args.epochs)
 
         # 用筛选后的数据重新训练
         best_dataset = BasicDataset(dir_best_data_img, dir_best_data_mask, img_scale=args.scale)

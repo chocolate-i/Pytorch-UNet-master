@@ -69,6 +69,7 @@ class BasicDataset(Dataset):
             # 将掩码值从 [0, 255] 映射到 [0, 1]
             img = img / 255  # 归一化到 [0, 1]
             img = img.astype(np.int64)  # 转换为整数类型
+           
             return img
         else:
             if img.ndim == 2:

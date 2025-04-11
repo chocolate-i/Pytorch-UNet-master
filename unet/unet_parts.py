@@ -5,8 +5,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class CBAM(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        # 通道注意力模块
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(in_channels // reduction_ratio, in_channels, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+        # 空间注意力模块
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # 通道注意力
+        ca = self.channel_attention(x)
+        x = x * ca
+        # 空间注意力
+        sa = self.spatial_attention(torch.cat([x.mean(dim=1, keepdim=True), x.max(dim=1, keepdim=True)[0]], dim=1))
+        x = x * sa
+        return x
+
+
 class DoubleConv(nn.Module):
-    """(convolution => [BN] => ReLU) * 2"""
+    """(convolution => [BN] => ReLU) * 2 + CBAM"""
 
     def __init__(self, in_channels, out_channels, mid_channels=None):
         super().__init__()
@@ -20,9 +47,12 @@ class DoubleConv(nn.Module):
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
+        self.cbam = CBAM(out_channels)  # 添加 CBAM 模块
 
     def forward(self, x):
-        return self.double_conv(x)
+        x = self.double_conv(x)
+        x = self.cbam(x)  # 应用 CBAM
+        return x
 
 
 class Down(nn.Module):

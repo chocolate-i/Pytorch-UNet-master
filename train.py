@@ -37,7 +37,7 @@ transform = transforms.Compose([
 
 
 class HybridLoss(nn.Module):
-    def __init__(self, alpha=0.85, gamma=2.5, smooth=1e-6):
+    def __init__(self, alpha=0.8, gamma=2, smooth=1e-6):
         super().__init__()
         self.alpha = alpha    # Focal Loss 正类权重
         self.gamma = gamma    # 难易样本调节因子
@@ -96,8 +96,8 @@ class HybridLoss(nn.Module):
 
         # 动态调整权重
         progress = epoch / total_epochs
-        focal_weight = max(0.2, 0.4 * (1 - progress))  # 随着训练进行，减少 Focal Loss 的权重
-        dice_weight = min(0.6, 0.4 + 0.2 * progress)   # 增加 Dice Loss 的权重
+        focal_weight = max(0.2, 0.4 * (1 - progress**2))  # 非线性减少 Focal Loss 权重
+        dice_weight = min(0.6, 0.4 + 0.2 * progress**2)   # 非线性增加 Dice Loss 权重
         boundary_weight = 0.2  # 边界损失权重保持不变
         return focal_weight, dice_weight, boundary_weight
 
@@ -266,7 +266,13 @@ def train_model(
     return model, dataset
 
 # 新增筛选函数
-def select_best_data(model, dataset, device, top_percent=0.2, amp=False):
+def select_best_data(model, dataset, device, top_percent=0.2, amp=False, epoch=None, total_epochs=None):
+    if epoch is not None and total_epochs is not None:
+        if epoch < total_epochs * 0.5:
+            top_percent = 0.3  # 前 50% 训练阶段，选择更多样本
+        else:
+            top_percent = 0.1  # 后 50% 训练阶段，选择更少但高质量的样本
+
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     scores = []
     indices = []
@@ -367,7 +373,7 @@ if __name__ == '__main__':
         )
 
         # 筛选高 Dice 数据
-        select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp)
+        select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp, epoch=args.epochs, total_epochs=args.epochs)
 
         # 用筛选后的数据重新训练
         best_dataset = BasicDataset(dir_best_data_img, dir_best_data_mask, img_scale=args.scale)
@@ -400,7 +406,7 @@ if __name__ == '__main__':
         )
 
         # 筛选高 Dice 数据
-        select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp)
+        select_best_data(trained_model, dataset, device, top_percent=args.top_percent, amp=args.amp, epoch=args.epochs, total_epochs=args.epochs)
 
         # 用筛选后的数据重新训练
         best_dataset = BasicDataset(dir_best_data_img, dir_best_data_mask, img_scale=args.scale)
